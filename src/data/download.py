@@ -4,6 +4,10 @@ Credentials are read from the environment (``KAGGLE_USERNAME`` and
 ``KAGGLE_KEY``) or from ``~/.kaggle/kaggle.json``. This module never writes
 credentials and nothing under ``data/raw/`` is committed.
 
+The PlantVillage step also fetches ``leaf-map.json`` from the original
+PlantVillage repository (no Kaggle key needed). ``src.data.splits`` uses it
+to keep every photo of one leaf in the same split.
+
 Usage (from the repository root)::
 
     python -m src.data.download
@@ -14,10 +18,13 @@ Usage (from the repository root)::
 from __future__ import annotations
 
 import argparse
+import hashlib
+import http.client
 import os
 import shutil
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
 
@@ -25,6 +32,7 @@ from src.data.labels import PLANTVILLAGE_CLASSES
 from src.data.paths import (
     DOWNLOAD_DIR,
     IMAGE_EXTENSIONS,
+    LEAF_MAP_PATH,
     PLANTDOC_DIR,
     PLANTVILLAGE_COLOR_DIR,
     PLANTVILLAGE_DIR,
@@ -33,6 +41,18 @@ from src.data.paths import (
 
 KAGGLE_DATASET = "abdallahalidev/plantvillage-dataset"
 PLANTDOC_REPO = "https://github.com/pratikkayal/PlantDoc-Dataset.git"
+
+# Leaf IDs published with PlantVillage (Mohanty et al. 2016): file name ->
+# "Class:::leaf number". Pinned to one commit and checked by SHA-256 so the
+# grouped split cannot change underneath the committed CSVs.
+LEAF_MAP_COMMIT = "7f7ecc7e1eaca78107e3affe7cb5abd9427e139a"
+LEAF_MAP_URL = (
+    "https://raw.githubusercontent.com/spMohanty/PlantVillage-Dataset/"
+    f"{LEAF_MAP_COMMIT}/leaf-map.json"
+)
+LEAF_MAP_SHA256 = (
+    "3b4b253683c6911744959a3870a92509b1faa1ee34e9f8585e21d0fe6337a25b"
+)
 
 
 class DownloadError(RuntimeError):
@@ -266,6 +286,55 @@ def download_plantvillage(force: bool = False, dry_run: bool = False) -> Path:
     return PLANTVILLAGE_COLOR_DIR
 
 
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_leaf_map(
+    force: bool = False,
+    dry_run: bool = False,
+    dest: Path = LEAF_MAP_PATH,
+) -> Path:
+    """Fetch the PlantVillage leaf-ID map (about 2.4 MB) to ``dest``."""
+    if dest.is_file() and not force and _sha256(dest) == LEAF_MAP_SHA256:
+        print(f"PlantVillage leaf map already present: {dest}")
+        return dest
+
+    print(f"PlantVillage leaf map: {LEAF_MAP_URL}")
+    print(f"Destination: {dest}")
+    if dry_run:
+        print("Dry run: not downloading the leaf map.")
+        return dest
+
+    manual = f"Fetch it manually with:\n  curl -L -o '{dest}' {LEAF_MAP_URL}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial = dest.with_name(dest.name + ".part")
+    try:
+        with urllib.request.urlopen(LEAF_MAP_URL, timeout=60) as response:
+            with partial.open("wb") as handle:
+                shutil.copyfileobj(response, handle)
+    except (OSError, http.client.HTTPException) as exc:
+        partial.unlink(missing_ok=True)
+        raise DownloadError(
+            f"Could not download the leaf map: {exc}\n{manual}"
+        ) from exc
+
+    digest = _sha256(partial)
+    if digest != LEAF_MAP_SHA256:
+        partial.unlink(missing_ok=True)
+        raise DownloadError(
+            f"Leaf map checksum mismatch: got {digest}, "
+            f"expected {LEAF_MAP_SHA256}.\n{manual}"
+        )
+    partial.replace(dest)
+    print(f"PlantVillage leaf map saved: {dest}")
+    return dest
+
+
 def _plantdoc_ready(dest: Path) -> bool:
     train_dir = dest / "train"
     test_dir = dest / "test"
@@ -340,6 +409,11 @@ def main(argv: list[str] | None = None) -> None:
             failures.append(str(exc))
 
     if do_plantvillage:
+        # The leaf map needs no Kaggle key, so fetch it first.
+        try:
+            download_leaf_map(force=args.force, dry_run=args.dry_run)
+        except DownloadError as exc:
+            failures.append(str(exc))
         try:
             download_plantvillage(force=args.force, dry_run=args.dry_run)
         except DownloadError as exc:
