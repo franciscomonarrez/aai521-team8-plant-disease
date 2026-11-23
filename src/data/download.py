@@ -8,6 +8,13 @@ The PlantVillage step also fetches ``leaf-map.json`` from the original
 PlantVillage repository (no Kaggle key needed). ``src.data.splits`` uses it
 to keep every photo of one leaf in the same split.
 
+PlantDoc is pinned to one upstream commit. Six of its file pairs differ only
+by letter case (``CAR1.jpg`` and ``car1.jpg``), which macOS and Windows
+cannot store side by side. On every OS the second file of each pair is
+written as ``<name>__case2<ext>``, so all 2,578 images are kept and every
+machine gets the same paths. A copy downloaded before this rule is repaired
+in place from a file-list-only clone (about 1 MB).
+
 Usage (from the repository root)::
 
     python -m src.data.download
@@ -20,11 +27,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import http.client
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import unicodedata
 import urllib.request
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from zipfile import ZipFile
 
@@ -41,6 +52,11 @@ from src.data.paths import (
 
 KAGGLE_DATASET = "abdallahalidev/plantvillage-dataset"
 PLANTDOC_REPO = "https://github.com/pratikkayal/PlantDoc-Dataset.git"
+# The PlantDoc commit the committed CSVs were built from (2 May 2021).
+PLANTDOC_COMMIT = "5467f6012d78d1c446145d5f582da6096f852ae8"
+# Written next to the images after a successful download or repair.
+PLANTDOC_SOURCE_FILE = "SOURCE.json"
+CASE_TWIN_MARK = "__case"
 
 # Leaf IDs published with PlantVillage (Mohanty et al. 2016): file name ->
 # "Class:::leaf number". Pinned to one commit and checked by SHA-256 so the
@@ -344,14 +360,205 @@ def _plantdoc_ready(dest: Path) -> bool:
     return len(train_classes) > 0
 
 
+def case_fold_key(path: str) -> str:
+    """Key under which macOS/Windows treat two names as the same file."""
+    return unicodedata.normalize("NFC", path).casefold()
+
+
+def case_twin_renames(paths: Iterable[str]) -> dict[str, str]:
+    """New names for files whose paths differ only by letter case.
+
+    Each group is sorted by code point, so ``CAR1.jpg`` comes before
+    ``car1.jpg``. The first path keeps its name; the n-th becomes
+    ``<stem>__case<n><suffix>`` (``car1.jpg`` -> ``car1__case2.jpg``).
+    The rule does not depend on the OS, so every machine gets the same
+    paths.
+    """
+    paths = list(paths)
+    groups: dict[str, list[str]] = {}
+    for path in paths:
+        groups.setdefault(case_fold_key(path), []).append(path)
+    taken = set(groups)
+    renames: dict[str, str] = {}
+    for members in groups.values():
+        for number, path in enumerate(sorted(members)[1:], start=2):
+            pure = PurePosixPath(path)
+            new_name = f"{pure.stem}{CASE_TWIN_MARK}{number}{pure.suffix}"
+            new_path = str(pure.with_name(new_name))
+            if case_fold_key(new_path) in taken:
+                raise DownloadError(f"Cannot rename {path}: {new_path} exists")
+            taken.add(case_fold_key(new_path))
+            renames[path] = new_path
+    return renames
+
+
+def _git_out(repo: Path, *args: str) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True
+    )
+    return result.stdout
+
+
+def _pin_plantdoc_commit(repo: Path) -> None:
+    """Make sure the pinned commit is in a shallow clone of PlantDoc."""
+    head = _git_out(repo, "rev-parse", "HEAD").decode().strip()
+    if head != PLANTDOC_COMMIT:
+        print(
+            f"PlantDoc upstream HEAD is {head[:12]}; fetching the pinned "
+            f"commit {PLANTDOC_COMMIT[:12]}."
+        )
+        _git_out(repo, "fetch", "--quiet", "--depth", "1", "origin",
+                 PLANTDOC_COMMIT)
+
+
+def _plantdoc_tree(repo: Path) -> dict[str, str]:
+    """``{path: blob id}`` for the files under train/ and test/."""
+    listing = _git_out(repo, "ls-tree", "-r", "-z", PLANTDOC_COMMIT)
+    entries: dict[str, str] = {}
+    for record in listing.split(b"\0"):
+        if not record:
+            continue
+        meta, _tab, raw_path = record.partition(b"\t")
+        _mode, kind, blob = meta.decode().split()
+        path = raw_path.decode("utf-8")
+        if kind == "blob" and path.split("/", 1)[0] in ("train", "test"):
+            entries[path] = blob
+    return entries
+
+
+def _git_blob_id(path: Path) -> str:
+    data = path.read_bytes()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def _write_case_twins(
+    dest: Path, repo: Path, entries: dict[str, str], renames: dict[str, str]
+) -> None:
+    """Write every member of a case-collision group from its git blob.
+
+    A checkout on a case-insensitive disk leaves one file per group (with
+    either twin's bytes). Every member name is removed first, then each
+    blob is written under its final name.
+    """
+    renamed_folds = {case_fold_key(path) for path in renames}
+    members = sorted(p for p in entries if case_fold_key(p) in renamed_folds)
+    for path in members:
+        (dest / path).unlink(missing_ok=True)
+    for path in members:
+        target = dest / renames.get(path, path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(_git_out(repo, "cat-file", "blob", entries[path]))
+
+
+def _verify_plantdoc(
+    dest: Path, entries: dict[str, str], renames: dict[str, str]
+) -> None:
+    """Fail unless ``dest`` holds exactly the pinned files, byte for byte."""
+    expected = {renames.get(path, path): blob for path, blob in entries.items()}
+    found: set[str] = set()
+    for split in ("train", "test"):
+        for folder, _dirs, files in os.walk(dest / split):
+            for name in files:
+                found.add((Path(folder) / name).relative_to(dest).as_posix())
+    found = {p for p in found if not PurePosixPath(p).name.startswith(".")}
+    missing = sorted(set(expected) - found)
+    extra = sorted(found - set(expected))
+    changed = sorted(
+        path for path in set(expected) & found
+        if _git_blob_id(dest / path) != expected[path]
+    )
+    if missing or extra or changed:
+        sample = (missing + extra + changed)[:5]
+        raise DownloadError(
+            f"PlantDoc at {dest} does not match commit "
+            f"{PLANTDOC_COMMIT[:12]}: {len(missing)} missing, "
+            f"{len(extra)} unexpected, {len(changed)} changed "
+            f"(e.g. {sample}).\n"
+            "Re-download it with: python -m src.data.download "
+            "--plantdoc-only --force"
+        )
+
+
+def read_plantdoc_source(dest: Path = PLANTDOC_DIR) -> dict | None:
+    """The ``SOURCE.json`` record written after download, if any."""
+    path = dest / PLANTDOC_SOURCE_FILE
+    if not path.is_file():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_plantdoc_source(
+    dest: Path, entries: dict[str, str], renames: dict[str, str]
+) -> None:
+    record = {
+        "repository": PLANTDOC_REPO,
+        "commit": PLANTDOC_COMMIT,
+        "images": len(entries),
+        "case_renames": dict(sorted(renames.items())),
+    }
+    (dest / PLANTDOC_SOURCE_FILE).write_text(
+        json.dumps(record, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _finish_plantdoc(dest: Path, repo: Path) -> None:
+    """Restore case twins, check every file, and record the source."""
+    entries = _plantdoc_tree(repo)
+    renames = case_twin_renames(entries)
+    _write_case_twins(dest, repo, entries, renames)
+    _verify_plantdoc(dest, entries, renames)
+    _write_plantdoc_source(dest, entries, renames)
+    for old, new in sorted(renames.items()):
+        print(f"  case twin kept as {new} (upstream {PurePosixPath(old).name})")
+    print(
+        f"PlantDoc images: {len(entries)} at commit {PLANTDOC_COMMIT[:12]}, "
+        "every file checked."
+    )
+
+
+def _repair_plantdoc(dest: Path) -> None:
+    """Bring a copy from before the case-twin rule up to date in place."""
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=DOWNLOAD_DIR) as scratch:
+        repo = Path(scratch) / "plantdoc-tree"
+        subprocess.run(
+            ["git", "clone", "--quiet", "--depth", "1", "--no-checkout",
+             "--filter=blob:none", PLANTDOC_REPO, str(repo)],
+            check=True,
+        )
+        _pin_plantdoc_commit(repo)
+        _finish_plantdoc(dest, repo)
+
+
 def download_plantdoc(force: bool = False, dry_run: bool = False) -> Path:
     """Clone the PlantDoc classification images into ``data/raw/plantdoc``."""
     RAW_DIR.mkdir(parents=True, exist_ok=True)
+    manual = (
+        "Check git and the network, then retry. A manual clone is not "
+        "enough: the case twins and SOURCE.json come from this script."
+    )
     if _plantdoc_ready(PLANTDOC_DIR) and not force:
-        print(f"PlantDoc already present: {PLANTDOC_DIR}")
+        source = read_plantdoc_source(PLANTDOC_DIR)
+        if source and source.get("commit") == PLANTDOC_COMMIT:
+            print(
+                f"PlantDoc already present: {PLANTDOC_DIR} "
+                f"(commit {PLANTDOC_COMMIT[:12]})"
+            )
+            return PLANTDOC_DIR
+        print(
+            f"PlantDoc at {PLANTDOC_DIR} predates the case-twin fix. "
+            "Repairing it from a file-list-only clone (about 1 MB)."
+        )
+        if dry_run:
+            print("Dry run: not repairing PlantDoc.")
+            return PLANTDOC_DIR
+        try:
+            _repair_plantdoc(PLANTDOC_DIR)
+        except subprocess.CalledProcessError as exc:
+            raise DownloadError(f"PlantDoc repair failed. {manual}") from exc
         return PLANTDOC_DIR
 
-    print(f"PlantDoc repository: {PLANTDOC_REPO}")
+    print(f"PlantDoc repository: {PLANTDOC_REPO} @ {PLANTDOC_COMMIT[:12]}")
     print(f"Destination: {PLANTDOC_DIR}")
     if dry_run:
         print("Dry run: not cloning PlantDoc.")
@@ -362,25 +569,30 @@ def download_plantdoc(force: bool = False, dry_run: bool = False) -> Path:
     PLANTDOC_DIR.parent.mkdir(parents=True, exist_ok=True)
     try:
         subprocess.run(
-            ["git", "clone", "--depth", "1", PLANTDOC_REPO, str(PLANTDOC_DIR)],
+            ["git", "clone", "--depth", "1", "--no-checkout",
+             PLANTDOC_REPO, str(PLANTDOC_DIR)],
             check=True,
         )
-    except subprocess.CalledProcessError as exc:
-        raise DownloadError(
-            "git clone of PlantDoc failed. Clone it manually with:\n"
-            f"  git clone --depth 1 {PLANTDOC_REPO} {PLANTDOC_DIR}"
-        ) from exc
-
-    git_dir = PLANTDOC_DIR / ".git"
-    if git_dir.exists():
-        shutil.rmtree(git_dir)
-    if not _plantdoc_ready(PLANTDOC_DIR):
-        raise DownloadError(
-            f"PlantDoc clone at {PLANTDOC_DIR} has no train/ and test/ class folders. "
-            "The upstream layout may have changed."
+        _pin_plantdoc_commit(PLANTDOC_DIR)
+        # On macOS/Windows git warns that some paths collided; the twins
+        # are rewritten under distinct names right after.
+        subprocess.run(
+            ["git", "-C", str(PLANTDOC_DIR), "checkout", "--quiet",
+             PLANTDOC_COMMIT],
+            check=True,
         )
-    image_count = sum(1 for path in PLANTDOC_DIR.rglob("*") if path.is_file() and _is_image_name(path.name))
-    print(f"PlantDoc images: {image_count}")
+        if not _plantdoc_ready(PLANTDOC_DIR):
+            raise DownloadError(
+                f"PlantDoc clone at {PLANTDOC_DIR} has no train/ and test/ "
+                "class folders. The upstream layout may have changed."
+            )
+        _finish_plantdoc(PLANTDOC_DIR, PLANTDOC_DIR)
+    except subprocess.CalledProcessError as exc:
+        raise DownloadError(f"git clone of PlantDoc failed. {manual}") from exc
+    finally:
+        git_dir = PLANTDOC_DIR / ".git"
+        if git_dir.exists():
+            shutil.rmtree(git_dir)
     return PLANTDOC_DIR
 
 

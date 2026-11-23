@@ -15,13 +15,19 @@ directory order, and the written CSVs are sorted the same way. Training code
 should shuffle in the DataLoader.
 
 PlantDoc is not mixed into train or val. Every mapped PlantDoc image is a
-field-photo test row whose ``label`` is the matching PlantVillage class.
-Classes that do not match are listed in ``data/plantdoc_label_map.csv`` and
-are left out of ``plantdoc_test.csv``.
+field-photo test row whose ``label`` is the matching PlantVillage class and
+whose ``source_split`` is PlantDoc's own train/ or test/ folder. Classes that
+do not match are listed in ``data/plantdoc_label_map.csv`` and are left out.
+Images listed in ``data/plantdoc_excluded.csv`` (hand-reviewed: duplicate
+photos, the same photo filed under two labels, and file names that name a
+different disease) are left out too. The build fails if that list does not
+match the PlantDoc copy on disk, if two paths differ only by letter case, or
+if two kept images are byte-identical.
 
 Usage (from the repository root)::
 
     python -m src.data.splits
+    python -m src.data.splits --plantdoc-only  # no PlantVillage needed
     python -m src.data.splits --map-only
     python -m src.data.splits --image-level   # old leaky split, for comparison
 """
@@ -38,9 +44,16 @@ import pandas as pd
 import sklearn
 from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 
+from src.data.download import (
+    PLANTDOC_COMMIT,
+    case_fold_key,
+    read_plantdoc_source,
+)
+from src.data.duplicates import md5_file
 from src.data.labels import (
     PLANTDOC_TO_PLANTVILLAGE,
     PLANTDOC_TO_PLANTVILLAGE_LABEL,
+    PLANTDOC_WITHOUT_USABLE_IMAGES,
     PLANTVILLAGE_CLASSES,
     UNMAPPED_PLANTVILLAGE,
 )
@@ -49,6 +62,7 @@ from src.data.paths import (
     LABEL_MAP_PATH,
     LEAF_MAP_PATH,
     PLANTDOC_DIR,
+    PLANTDOC_EXCLUDED_PATH,
     PLANTVILLAGE_COLOR_DIR,
     PROJECT_ROOT,
     SPLITS_DIR,
@@ -61,7 +75,18 @@ TEST_RATIO = 0.15
 N_FOLDS = 20
 SPLIT_COLUMNS = ["path", "label"]
 PLANTVILLAGE_COLUMNS = ["path", "label", "group", "fold"]
-MAP_COLUMNS = ["plantdoc_class", "plantvillage_label", "status", "notes"]
+PLANTDOC_COLUMNS = ["path", "label", "source_split"]
+MAP_COLUMNS = [
+    "plantdoc_class", "plantvillage_label", "status", "confidence", "notes",
+]
+EXCLUDED_COLUMNS = [
+    "path", "source_split", "label", "reason", "kept_path", "detail",
+]
+# file_name: the name says another disease, crop or a symptom in a healthy
+# folder. duplicate: another copy of the same photo (same label) is kept.
+# conflicting_duplicate: the same photo is filed under another label; at
+# most one copy is kept, and only when a file name settles the label.
+EXCLUSION_REASONS = ("file_name", "duplicate", "conflicting_duplicate")
 
 # leaf-map.json calls Apple black rot "Apple_Frogeye Spot".
 LEAF_MAP_CLASS_ALIASES = {"Apple___Black_rot": "Apple_Frogeye Spot"}
@@ -338,13 +363,13 @@ def iter_plantdoc_class_dirs(plantdoc_root: Path) -> list[tuple[str, Path]]:
     return found
 
 
-def collect_plantdoc_test(plantdoc_root: Path, project_root: Path = PROJECT_ROOT) -> tuple[pd.DataFrame, list[str]]:
-    """Map PlantDoc images onto PlantVillage labels.
+def scan_plantdoc(
+    plantdoc_root: Path, project_root: Path = PROJECT_ROOT
+) -> tuple[pd.DataFrame, list[str], int]:
+    """Every PlantDoc image in a mapped folder, before any exclusion.
 
-    Both upstream train and test folders are included. PlantDoc is a field
-    test set for models trained on PlantVillage, so its own train folder is
-    not used for training. Returns the test frame and PlantDoc class names
-    that had no crosswalk entry.
+    Returns ``path,label,source_split`` rows, the PlantDoc folders with no
+    crosswalk entry, and the number of images seen in all folders.
     """
     class_dirs = iter_plantdoc_class_dirs(plantdoc_root)
     if not class_dirs:
@@ -354,34 +379,177 @@ def collect_plantdoc_test(plantdoc_root: Path, project_root: Path = PROJECT_ROOT
         )
     rows: list[dict[str, str]] = []
     unknown: list[str] = []
-    for _split_name, class_dir in class_dirs:
+    seen = 0
+    for split_name, class_dir in class_dirs:
+        images = sorted(p for p in class_dir.rglob("*") if is_image(p))
+        seen += len(images)
         plantvillage_label = PLANTDOC_TO_PLANTVILLAGE_LABEL.get(class_dir.name)
         if plantvillage_label is None:
             unknown.append(class_dir.name)
             continue
-        for image_path in sorted(path for path in class_dir.rglob("*") if is_image(path)):
+        for image_path in images:
             rows.append(
                 {
                     "path": relative_posix(image_path, project_root),
                     "label": plantvillage_label,
+                    "source_split": split_name,
                 }
             )
-    frame = pd.DataFrame(rows, columns=SPLIT_COLUMNS)
-    if not frame.empty:
-        frame = frame.drop_duplicates(subset=["path"]).sort_values(SPLIT_COLUMNS).reset_index(drop=True)
-    return frame, sorted(set(unknown))
+    frame = pd.DataFrame(rows, columns=PLANTDOC_COLUMNS)
+    frame = frame.sort_values(SPLIT_COLUMNS).reset_index(drop=True)
+    return frame, sorted(set(unknown)), seen
+
+
+def check_plantdoc_copy(
+    plantdoc_root: Path, frame: pd.DataFrame, seen: int
+) -> None:
+    """Fail unless this is the pinned PlantDoc copy with both case twins.
+
+    A copy cloned on macOS or Windows before the case-twin fix is missing
+    six images, and a Linux copy has twins that the committed CSV renamed.
+    """
+    repair = (
+        "Run python -m src.data.download --plantdoc-only to repair it "
+        "(downloads about 1 MB)."
+    )
+    source = read_plantdoc_source(plantdoc_root)
+    if source is None or source.get("commit") != PLANTDOC_COMMIT:
+        raise ValueError(
+            f"{plantdoc_root} is not the PlantDoc copy this project pins "
+            f"(commit {PLANTDOC_COMMIT[:12]}, recorded in SOURCE.json). "
+            + repair
+        )
+    if seen != source.get("images"):
+        raise ValueError(
+            f"Found {seen} PlantDoc images, but SOURCE.json lists "
+            f"{source.get('images')}. " + repair
+        )
+    folded = frame["path"].map(case_fold_key)
+    clash = frame.loc[folded.duplicated(keep=False), "path"].tolist()
+    if clash:
+        raise ValueError(
+            "PlantDoc paths that differ only by letter case would load the "
+            f"same file on macOS/Windows: {clash[:4]}. " + repair
+        )
+
+
+def load_plantdoc_exclusions(
+    path: Path = PLANTDOC_EXCLUDED_PATH,
+) -> pd.DataFrame:
+    """Read the reviewed PlantDoc exclusion list."""
+    if not path.is_file():
+        raise FileNotFoundError(f"PlantDoc exclusion list not found: {path}")
+    frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+    missing = set(EXCLUDED_COLUMNS) - set(frame.columns)
+    if missing:
+        raise ValueError(f"{path} is missing columns: {sorted(missing)}")
+    unknown = set(frame["reason"]) - set(EXCLUSION_REASONS)
+    if unknown:
+        raise ValueError(f"{path} has unknown reasons: {sorted(unknown)}")
+    if frame["path"].duplicated().any():
+        raise ValueError(f"{path} lists a path twice")
+    return frame.loc[:, EXCLUDED_COLUMNS]
+
+
+def apply_plantdoc_exclusions(
+    frame: pd.DataFrame, exclusions: pd.DataFrame
+) -> pd.DataFrame:
+    """Drop the listed rows after checking the list matches ``frame``."""
+    labels = dict(zip(frame["path"], frame["label"], strict=True))
+    absent = sorted(set(exclusions["path"]) - set(labels))
+    if absent:
+        raise ValueError(
+            f"{len(absent)} excluded PlantDoc paths are not in this copy "
+            f"(e.g. {absent[0]}). The exclusion list was made for commit "
+            f"{PLANTDOC_COMMIT[:12]} at data/raw/plantdoc."
+        )
+    relabeled = [
+        path
+        for path, label in zip(
+            exclusions["path"], exclusions["label"], strict=True
+        )
+        if labels[path] != label
+    ]
+    if relabeled:
+        raise ValueError(
+            "The crosswalk label changed for excluded PlantDoc images "
+            f"(e.g. {relabeled[0]}); review data/plantdoc_excluded.csv."
+        )
+    kept = frame.loc[~frame["path"].isin(exclusions["path"])]
+    targets = set(exclusions["kept_path"]) - {""}
+    dangling = sorted(targets - set(kept["path"]))
+    if dangling:
+        raise ValueError(f"kept_path is not a kept image: {dangling[0]}")
+    return kept.reset_index(drop=True)
+
+
+def check_no_byte_duplicates(
+    frame: pd.DataFrame, project_root: Path = PROJECT_ROOT
+) -> None:
+    """Fail if two rows point at byte-identical files."""
+    digests = frame["path"].map(lambda path: md5_file(project_root / path))
+    copies = frame.loc[digests.duplicated(keep=False), "path"].tolist()
+    if copies:
+        raise RuntimeError(
+            f"{len(copies)} PlantDoc test images are byte-identical copies, "
+            f"e.g. {copies[:2]}. Add them to data/plantdoc_excluded.csv."
+        )
+
+
+def collect_plantdoc_test(
+    plantdoc_root: Path,
+    project_root: Path = PROJECT_ROOT,
+    excluded_path: Path = PLANTDOC_EXCLUDED_PATH,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """Map PlantDoc images onto PlantVillage labels, minus the exclusions.
+
+    Both upstream train and test folders are included. PlantDoc is a field
+    test set for models trained on PlantVillage, so its own train folder is
+    not used for training. Returns the kept rows, the exclusion list, and
+    PlantDoc class names that had no crosswalk entry.
+    """
+    frame, unknown, seen = scan_plantdoc(plantdoc_root, project_root)
+    check_plantdoc_copy(plantdoc_root, frame, seen)
+    exclusions = load_plantdoc_exclusions(excluded_path)
+    kept = apply_plantdoc_exclusions(frame, exclusions)
+    check_no_byte_duplicates(kept, project_root)
+    no_images = {
+        PLANTDOC_TO_PLANTVILLAGE_LABEL[name]
+        for name in PLANTDOC_WITHOUT_USABLE_IMAGES
+    }
+    expected = set(PLANTDOC_TO_PLANTVILLAGE_LABEL.values()) - no_images
+    if set(kept["label"]) != expected:
+        raise ValueError(
+            "PlantDoc classes with images do not match the crosswalk: "
+            f"missing {sorted(expected - set(kept['label']))}, "
+            f"unexpected {sorted(set(kept['label']) - expected)}"
+        )
+    return kept, exclusions, unknown
 
 
 def label_map_frame(extra_unmapped_plantdoc: list[str] | None = None) -> pd.DataFrame:
-    """Documented crosswalk, including PlantVillage classes with no field photos."""
+    """Documented crosswalk, including PlantVillage classes with no field photos.
+
+    ``status`` is ``mapped`` (field photos in plantdoc_test.csv),
+    ``no_usable_images`` (the folder maps here but every image was
+    excluded) or ``unmapped`` (no PlantDoc folder).
+    """
     rows: list[dict[str, str]] = []
     known = set(PLANTDOC_TO_PLANTVILLAGE_LABEL)
-    for plantdoc_class, plantvillage_label, notes in PLANTDOC_TO_PLANTVILLAGE:
+    for plantdoc_class, plantvillage_label, confidence, notes in (
+        PLANTDOC_TO_PLANTVILLAGE
+    ):
+        status = (
+            "no_usable_images"
+            if plantdoc_class in PLANTDOC_WITHOUT_USABLE_IMAGES
+            else "mapped"
+        )
         rows.append(
             {
                 "plantdoc_class": plantdoc_class,
                 "plantvillage_label": plantvillage_label,
-                "status": "mapped",
+                "status": status,
+                "confidence": confidence,
                 "notes": notes,
             }
         )
@@ -391,6 +559,7 @@ def label_map_frame(extra_unmapped_plantdoc: list[str] | None = None) -> pd.Data
                 "plantdoc_class": "",
                 "plantvillage_label": plantvillage_label,
                 "status": "unmapped",
+                "confidence": "",
                 "notes": notes,
             }
         )
@@ -402,6 +571,7 @@ def label_map_frame(extra_unmapped_plantdoc: list[str] | None = None) -> pd.Data
                 "plantdoc_class": class_name,
                 "plantvillage_label": "",
                 "status": "unmapped",
+                "confidence": "",
                 "notes": (
                     "Found in the PlantDoc download but not in the curated crosswalk. "
                     "Excluded from plantdoc_test.csv."
@@ -416,7 +586,11 @@ def write_frame(frame: pd.DataFrame, path: Path, columns: list[str]) -> None:
     frame.to_csv(path, index=False, columns=columns, encoding="utf-8")
 
 
-def summarize(parts: dict[str, pd.DataFrame], plantdoc: pd.DataFrame | None) -> str:
+def summarize(
+    parts: dict[str, pd.DataFrame],
+    plantdoc: pd.DataFrame | None,
+    excluded: pd.DataFrame | None = None,
+) -> str:
     lines = []
     total = sum(len(part) for part in parts.values())
     lines.append(f"PlantVillage images: {total}")
@@ -462,10 +636,51 @@ def summarize(parts: dict[str, pd.DataFrame], plantdoc: pd.DataFrame | None) -> 
     if plantdoc is None:
         lines.append("PlantDoc test CSV: not written (dataset missing)")
     else:
-        lines.append(f"PlantDoc field-test images: {len(plantdoc)}")
-        lines.append(f"PlantDoc classes present in the test CSV: {plantdoc['label'].nunique()}")
-    lines.append(f"PlantVillage classes with no PlantDoc photos: {len(UNMAPPED_PLANTVILLAGE)}")
+        lines.append(summarize_plantdoc(plantdoc, excluded))
     return "\n".join(lines)
+
+
+def summarize_plantdoc(
+    plantdoc: pd.DataFrame, excluded: pd.DataFrame | None = None
+) -> str:
+    """Counts for plantdoc_test.csv and the exclusions behind it."""
+    lines = [
+        f"PlantDoc field-test images: {len(plantdoc)} "
+        f"(upstream train/ {int((plantdoc['source_split'] == 'train').sum())},"
+        f" test/ {int((plantdoc['source_split'] == 'test').sum())})"
+    ]
+    if excluded is not None:
+        reasons = excluded["reason"].value_counts()
+        detail = ", ".join(
+            f"{reason} {int(reasons.get(reason, 0))}"
+            for reason in EXCLUSION_REASONS
+        )
+        lines.append(
+            f"PlantDoc images excluded: {len(excluded)} ({detail}); "
+            "see data/plantdoc_excluded.csv"
+        )
+    lines.append(
+        "PlantDoc classes present in the test CSV: "
+        f"{plantdoc['label'].nunique()}"
+    )
+    without = len(UNMAPPED_PLANTVILLAGE) + len(PLANTDOC_WITHOUT_USABLE_IMAGES)
+    lines.append(f"PlantVillage classes with no PlantDoc photos: {without}")
+    return "\n".join(lines)
+
+
+def _write_plantdoc(
+    plantdoc_dir: Path,
+    splits_dir: Path,
+    project_root: Path,
+    excluded_path: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    plantdoc, excluded, unknown = collect_plantdoc_test(
+        plantdoc_dir, project_root, excluded_path
+    )
+    destination = splits_dir / "plantdoc_test.csv"
+    write_frame(plantdoc, destination, PLANTDOC_COLUMNS)
+    print(f"Wrote {destination} ({len(plantdoc)} rows)")
+    return plantdoc, excluded, unknown
 
 
 def build_splits(
@@ -478,15 +693,29 @@ def build_splits(
     project_root: Path = PROJECT_ROOT,
     leaf_map_path: Path = LEAF_MAP_PATH,
     image_level: bool = False,
+    plantdoc_only: bool = False,
+    plantdoc_excluded_path: Path = PLANTDOC_EXCLUDED_PATH,
 ) -> None:
     """Write the split CSVs, the PlantDoc test CSV, and the label map.
 
     With ``image_level=True`` only ``{train,val,test}_imagelevel.csv`` are
-    written, using the original image-level split (for comparison).
+    written, using the original image-level split (for comparison). With
+    ``plantdoc_only=True`` only ``plantdoc_test.csv`` and the label map are
+    written, so PlantVillage is not needed.
     """
     if map_only:
         write_frame(label_map_frame(), label_map_path, MAP_COLUMNS)
         print(f"Wrote {label_map_path}")
+        return
+
+    if plantdoc_only:
+        splits_dir.mkdir(parents=True, exist_ok=True)
+        plantdoc, excluded, unknown = _write_plantdoc(
+            plantdoc_dir, splits_dir, project_root, plantdoc_excluded_path
+        )
+        write_frame(label_map_frame(unknown), label_map_path, MAP_COLUMNS)
+        print(f"Wrote {label_map_path}")
+        print(summarize_plantdoc(plantdoc, excluded))
         return
 
     if not color_dir.is_dir():
@@ -517,12 +746,12 @@ def build_splits(
         print(f"Wrote {destination} ({len(part)} rows)")
 
     plantdoc_frame: pd.DataFrame | None = None
+    excluded: pd.DataFrame | None = None
     extra_unknown: list[str] = []
     if plantdoc_dir.is_dir() and (plantdoc_dir / "train").is_dir():
-        plantdoc_frame, extra_unknown = collect_plantdoc_test(plantdoc_dir, project_root)
-        destination = splits_dir / "plantdoc_test.csv"
-        write_frame(plantdoc_frame, destination, SPLIT_COLUMNS)
-        print(f"Wrote {destination} ({len(plantdoc_frame)} rows)")
+        plantdoc_frame, excluded, extra_unknown = _write_plantdoc(
+            plantdoc_dir, splits_dir, project_root, plantdoc_excluded_path
+        )
     else:
         print(f"PlantDoc not found at {plantdoc_dir}; skipped plantdoc_test.csv")
 
@@ -530,7 +759,7 @@ def build_splits(
     print(f"Wrote {label_map_path}")
     if extra_unknown:
         print("Unmapped PlantDoc classes (excluded from the test CSV): " + ", ".join(extra_unknown))
-    print(summarize(parts, plantdoc_frame))
+    print(summarize(parts, plantdoc_frame, excluded))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -555,7 +784,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "It puts the same leaf in train and test; comparison only."
         ),
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--plantdoc-only",
+        action="store_true",
+        help="Write only plantdoc_test.csv and the label map (no PlantVillage needed).",
+    )
+    parser.add_argument(
+        "--plantdoc-excluded",
+        type=Path,
+        default=PLANTDOC_EXCLUDED_PATH,
+        help="Reviewed list of PlantDoc images to leave out.",
+    )
+    args = parser.parse_args(argv)
+    modes = [args.map_only, args.image_level, args.plantdoc_only]
+    if sum(modes) > 1:
+        parser.error("Choose at most one of --map-only, --image-level and --plantdoc-only.")
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -570,8 +814,10 @@ def main(argv: list[str] | None = None) -> None:
             map_only=args.map_only,
             leaf_map_path=args.leaf_map_json,
             image_level=args.image_level,
+            plantdoc_only=args.plantdoc_only,
+            plantdoc_excluded_path=args.plantdoc_excluded,
         )
-    except (FileNotFoundError, ValueError) as exc:
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1) from exc
 

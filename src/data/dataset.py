@@ -3,6 +3,8 @@
 Images are 224x224 with ImageNet normalization. The train pipeline randomly
 crops, flips, rotates, and jitters color. Val, test, and PlantDoc use a
 resize to the shorter side of 256 and a center crop, which keeps aspect ratio.
+EXIF orientation is applied before any transform, and every image is
+converted to RGB (PlantDoc has a few CMYK, RGBA and grayscale files).
 
 Labels are integer indexes into ``PLANTVILLAGE_CLASSES`` (alphabetical). A
 PlantDoc row uses the same index as the PlantVillage class it was mapped to,
@@ -23,7 +25,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
@@ -126,7 +128,10 @@ class PlantDiseaseDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[object, int]:
         path = self._resolve(self.paths[index])
         try:
-            image = Image.open(path).convert("RGB")
+            with Image.open(path) as raw:
+                # Phone photos can store their rotation as an EXIF tag
+                # (29 PlantDoc images); apply it so the leaf is upright.
+                image = ImageOps.exif_transpose(raw).convert("RGB")
         except OSError as exc:
             raise OSError(f"Could not read image {path}") from exc
         if self.transform is not None:

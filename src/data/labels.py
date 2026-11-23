@@ -53,148 +53,220 @@ CLASS_TO_IDX: dict[str, int] = {name: index for index, name in enumerate(PLANTVI
 IDX_TO_CLASS: dict[int, str] = {index: name for name, index in CLASS_TO_IDX.items()}
 NUM_CLASSES = len(PLANTVILLAGE_CLASSES)
 
-# (plantdoc folder, plantvillage folder, why this pair is the right match)
-PLANTDOC_TO_PLANTVILLAGE: tuple[tuple[str, str, str], ...] = (
+# (plantdoc folder, plantvillage folder, confidence, notes)
+# confidence: "exact" when the PlantDoc folder names the same condition as
+# the PlantVillage class; "approximate" when the folder is broader and the
+# class is only the nearest match. Images whose file names contradict their
+# folder are listed, with reasons, in data/plantdoc_excluded.csv.
+PLANTDOC_TO_PLANTVILLAGE: tuple[tuple[str, str, str, str], ...] = (
     (
         "Apple Scab Leaf",
         "Apple___Apple_scab",
+        "exact",
         "Apple scab.",
     ),
     (
         "Apple leaf",
         "Apple___healthy",
-        "Healthy apple leaf.",
+        "exact",
+        "Healthy apple leaf. Names that say yellowing or aphid leaf curl "
+        "are excluded.",
     ),
     (
         "Apple rust leaf",
         "Apple___Cedar_apple_rust",
-        "PlantDoc apple rust matches cedar-apple rust, the only apple rust class in PlantVillage.",
+        "approximate",
+        "PlantDoc says only 'apple rust'; cedar-apple rust is PlantVillage's "
+        "one apple rust class. Names that say scab, black rot or rust mite "
+        "are excluded.",
     ),
     (
         "Bell_pepper leaf",
         "Pepper,_bell___healthy",
-        "Healthy bell pepper. PlantDoc uses an underscore in the folder name.",
+        "exact",
+        "Healthy bell pepper (the folder name has an underscore). Names that "
+        "say yellow or curling leaves, a virus or pests are excluded.",
     ),
     (
         "Bell_pepper leaf spot",
         "Pepper,_bell___Bacterial_spot",
-        "Bell-pepper leaf spot is bacterial spot, PlantVillage's only pepper disease class.",
+        "approximate",
+        "PlantDoc 'leaf spot' is broader than bacterial spot, PlantVillage's "
+        "only pepper disease. Names that say canker, gray leaf spot, "
+        "Septoria or dogwood are excluded.",
     ),
     (
         "Blueberry leaf",
         "Blueberry___healthy",
-        "Healthy blueberry. PlantVillage has no diseased blueberry class.",
+        "exact",
+        "Healthy blueberry; PlantVillage has no diseased blueberry class. "
+        "Names that say disease, damage, chlorosis, iron deficiency or a "
+        "pest are excluded.",
     ),
     (
         "Cherry leaf",
         "Cherry_(including_sour)___healthy",
-        "Healthy cherry. PlantDoc has no cherry powdery-mildew class.",
+        "exact",
+        "Healthy cherry; PlantDoc has no cherry powdery-mildew class. Names "
+        "that say nitrogen deficiency or cherry laurel are excluded.",
     ),
     (
         "Corn Gray leaf spot",
         "Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot",
-        "Gray leaf spot (Cercospora).",
+        "exact",
+        "Gray leaf spot (Cercospora). Two comparison figures (with northern "
+        "leaf blight, with bacterial leaf streak) are excluded.",
     ),
     (
         "Corn leaf blight",
         "Corn_(maize)___Northern_Leaf_Blight",
-        "PlantDoc corn blight maps to northern leaf blight, not to gray leaf spot (that class is separate).",
+        "approximate",
+        "PlantDoc's leaf-blight folder mixes corn diseases. Names that say "
+        "gray leaf spot, bacterial leaf streak, southern corn leaf blight, "
+        "Goss's wilt, Stewart's wilt, anthracnose or leaf scald are "
+        "excluded; unnamed photos of those diseases may remain.",
     ),
     (
         "Corn rust leaf",
         "Corn_(maize)___Common_rust_",
-        "Common rust. The PlantVillage folder name keeps a trailing underscore.",
+        "approximate",
+        "PlantDoc says only 'corn rust'. Names that say southern rust "
+        "(Puccinia polysora, a different pathogen), stripe rust or tar spot "
+        "are excluded; unnamed southern-rust photos may remain. The "
+        "PlantVillage folder name keeps a trailing underscore.",
     ),
     (
         "Peach leaf",
         "Peach___healthy",
-        "Healthy peach. PlantDoc has no peach bacterial-spot class.",
+        "exact",
+        "Healthy peach; PlantDoc has no peach bacterial-spot class. A photo "
+        "named as a rose tree is excluded.",
     ),
     (
         "Potato leaf early blight",
         "Potato___Early_blight",
-        "Early blight.",
+        "exact",
+        "Early blight. Many names in this folder say late blight "
+        "(Phytophthora infestans) or early blight on tomato; those are "
+        "excluded.",
     ),
     (
         "Potato leaf late blight",
         "Potato___Late_blight",
-        "Late blight.",
+        "exact",
+        "Late blight. Names that also say early blight are excluded.",
     ),
     (
         "Raspberry leaf",
         "Raspberry___healthy",
-        "Healthy raspberry.",
+        "exact",
+        "Healthy raspberry. Names that say rust, spots, beetles, iron "
+        "deficiency or poison ivy are excluded.",
     ),
     (
         "Soyabean leaf",
         "Soybean___healthy",
-        "Healthy soybean. PlantDoc spells the folder Soyabean.",
+        "exact",
+        "Healthy soybean (PlantDoc spells it Soyabean). Names that say "
+        "potassium deficiency, brown spot, downy mildew or raspberry are "
+        "excluded.",
     ),
     (
         "Squash Powdery mildew leaf",
         "Squash___Powdery_mildew",
-        "Powdery mildew.",
+        "exact",
+        "Powdery mildew. Names that say cucumber or downy mildew are "
+        "excluded.",
     ),
     (
         "Strawberry leaf",
         "Strawberry___healthy",
-        "Healthy strawberry. This is not leaf scorch.",
+        "exact",
+        "Healthy strawberry, not leaf scorch. Names that say red spots, "
+        "yellow leaves or cold damage are excluded.",
     ),
     (
         "Tomato Early blight leaf",
         "Tomato___Early_blight",
-        "Early blight.",
+        "exact",
+        "Early blight. Names that say potato, canker or late blight are "
+        "excluded.",
     ),
     (
         "Tomato Septoria leaf spot",
         "Tomato___Septoria_leaf_spot",
-        "Septoria leaf spot.",
+        "exact",
+        "Septoria leaf spot. Names that say early blight, gray leaf spot, "
+        "bacterial spot or bean rust are excluded.",
     ),
     (
         "Tomato leaf",
         "Tomato___healthy",
-        "Healthy tomato.",
+        "exact",
+        "Healthy tomato. Names that say late blight, bacterial leaf spot, "
+        "curling, yellow leaves or basil are excluded.",
     ),
     (
         "Tomato leaf bacterial spot",
         "Tomato___Bacterial_spot",
-        "Bacterial spot.",
+        "exact",
+        "Bacterial spot (Xanthomonas). Names that say bacterial speck or "
+        "canker, which are different bacterial diseases, are excluded.",
     ),
     (
         "Tomato leaf late blight",
         "Tomato___Late_blight",
-        "Late blight.",
+        "exact",
+        "Late blight. A name that says early blight is excluded.",
     ),
     (
         "Tomato leaf mosaic virus",
         "Tomato___Tomato_mosaic_virus",
-        "Tomato mosaic virus.",
+        "approximate",
+        "PlantDoc says only 'mosaic virus'; PlantVillage's class is tomato "
+        "mosaic virus (ToMV). Names that say another virus (ToBRFV; TMV, "
+        "CMV or PepMV; leaf curl on luffa) are excluded.",
     ),
     (
         "Tomato leaf yellow virus",
         "Tomato___Tomato_Yellow_Leaf_Curl_Virus",
-        "Yellow-virus symptoms map to tomato yellow leaf curl virus.",
+        "approximate",
+        "Yellow-virus symptoms map to tomato yellow leaf curl virus, the "
+        "nearest class. A name that also says mosaic virus is excluded.",
     ),
     (
         "Tomato mold leaf",
         "Tomato___Leaf_Mold",
-        "Leaf mold.",
+        "exact",
+        "Leaf mold. Names that say gray leaf spot or TYLC are excluded.",
     ),
     (
         "Tomato two spotted spider mites leaf",
         "Tomato___Spider_mites Two-spotted_spider_mite",
-        "Two-spotted spider mite. Upstream PlantDoc keeps this class in train only.",
+        "exact",
+        "Both PlantDoc images are labeled comparison panels (spot, speck, "
+        "early blight and mite damage; canker), not spider-mite photos. "
+        "Both are excluded, so this class has no field-test images.",
     ),
     (
         "grape leaf",
         "Grape___healthy",
+        "exact",
         "Healthy grape. The PlantDoc folder name is lowercase.",
     ),
     (
         "grape leaf black rot",
         "Grape___Black_rot",
-        "Black rot. The PlantDoc folder name is lowercase.",
+        "exact",
+        "Black rot. The PlantDoc folder name is lowercase. Names that say "
+        "downy mildew, anthracnose or rust are excluded.",
     ),
+)
+
+# PlantDoc folders whose every image is in data/plantdoc_excluded.csv. The
+# mapping is right, but the class has no field-test images.
+PLANTDOC_WITHOUT_USABLE_IMAGES: tuple[str, ...] = (
+    "Tomato two spotted spider mites leaf",
 )
 
 # PlantVillage classes with no honest PlantDoc counterpart. Left out of the
@@ -244,7 +316,9 @@ UNMAPPED_PLANTVILLAGE: tuple[tuple[str, str], ...] = (
 
 PLANTDOC_TO_PLANTVILLAGE_LABEL: dict[str, str] = {
     plantdoc_class: plantvillage_label
-    for plantdoc_class, plantvillage_label, _notes in PLANTDOC_TO_PLANTVILLAGE
+    for plantdoc_class, plantvillage_label, _confidence, _notes in (
+        PLANTDOC_TO_PLANTVILLAGE
+    )
 }
 
 CROP_DISPLAY_NAMES: dict[str, str] = {
@@ -288,8 +362,12 @@ def _check_label_tables() -> None:
         raise RuntimeError("PLANTVILLAGE_CLASSES must stay in alphabetical order.")
     if len(PLANTVILLAGE_CLASSES) != len(set(PLANTVILLAGE_CLASSES)):
         raise RuntimeError("Duplicate PlantVillage class name.")
-    mapped = [plantvillage for _plantdoc, plantvillage, _notes in PLANTDOC_TO_PLANTVILLAGE]
-    plantdoc_names = [plantdoc for plantdoc, _plantvillage, _notes in PLANTDOC_TO_PLANTVILLAGE]
+    mapped = [row[1] for row in PLANTDOC_TO_PLANTVILLAGE]
+    plantdoc_names = [row[0] for row in PLANTDOC_TO_PLANTVILLAGE]
+    if {row[2] for row in PLANTDOC_TO_PLANTVILLAGE} - {"exact", "approximate"}:
+        raise RuntimeError("PlantDoc map confidence must be exact or approximate.")
+    if set(PLANTDOC_WITHOUT_USABLE_IMAGES) - set(plantdoc_names):
+        raise RuntimeError("PLANTDOC_WITHOUT_USABLE_IMAGES names an unknown folder.")
     unmapped = [plantvillage for plantvillage, _notes in UNMAPPED_PLANTVILLAGE]
     if len(mapped) != len(set(mapped)):
         raise RuntimeError("Duplicate PlantVillage label in the PlantDoc map.")
