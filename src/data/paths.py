@@ -10,12 +10,10 @@ RAW_DIR = DATA_DIR / "raw"
 PLANTVILLAGE_DIR = RAW_DIR / "plantvillage"
 PLANTVILLAGE_COLOR_DIR = PLANTVILLAGE_DIR / "color"
 PLANTDOC_DIR = RAW_DIR / "plantdoc"
-# Leaf IDs from the original PlantVillage release. Kept outside
-# PLANTVILLAGE_DIR so ``download --force`` does not delete it.
+# Outside PLANTVILLAGE_DIR so ``download --force`` does not delete it.
 LEAF_MAP_PATH = RAW_DIR / "plantvillage-leaf-map.json"
 SPLITS_DIR = DATA_DIR / "splits"
 LABEL_MAP_PATH = DATA_DIR / "plantdoc_label_map.csv"
-# Hand-reviewed PlantDoc images left out of plantdoc_test.csv, with reasons.
 PLANTDOC_EXCLUDED_PATH = DATA_DIR / "plantdoc_excluded.csv"
 DOWNLOAD_DIR = RAW_DIR / "_downloads"
 

@@ -1,14 +1,8 @@
-"""PyTorch dataset and loaders for the plant-disease CSVs.
+"""PyTorch dataset and loaders for the split CSVs.
 
-Images are 224x224 with ImageNet normalization. The train pipeline randomly
-crops, flips, rotates, and jitters color. Val, test, and PlantDoc use a
-resize to the shorter side of 256 and a center crop, which keeps aspect ratio.
-EXIF orientation is applied before any transform, and every image is
-converted to RGB (PlantDoc has a few CMYK, RGBA and grayscale files).
-
-Labels are integer indexes into ``PLANTVILLAGE_CLASSES`` (alphabetical). A
-PlantDoc row uses the same index as the PlantVillage class it was mapped to,
-even when that CSV does not contain every class.
+Images are cropped to 224x224 and normalized with ImageNet statistics.
+Labels are indexes into ``PLANTVILLAGE_CLASSES``, so PlantDoc rows use the
+same index as the class they map to.
 
 Usage::
 
@@ -129,8 +123,7 @@ class PlantDiseaseDataset(Dataset):
         path = self._resolve(self.paths[index])
         try:
             with Image.open(path) as raw:
-                # Phone photos can store their rotation as an EXIF tag
-                # (29 PlantDoc images); apply it so the leaf is upright.
+                # Apply EXIF rotation so phone photos are upright.
                 image = ImageOps.exif_transpose(raw).convert("RGB")
         except OSError as exc:
             raise OSError(f"Could not read image {path}") from exc

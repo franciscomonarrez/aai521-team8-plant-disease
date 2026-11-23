@@ -53,11 +53,8 @@ CLASS_TO_IDX: dict[str, int] = {name: index for index, name in enumerate(PLANTVI
 IDX_TO_CLASS: dict[int, str] = {index: name for name, index in CLASS_TO_IDX.items()}
 NUM_CLASSES = len(PLANTVILLAGE_CLASSES)
 
-# (plantdoc folder, plantvillage folder, confidence, notes)
-# confidence: "exact" when the PlantDoc folder names the same condition as
-# the PlantVillage class; "approximate" when the folder is broader and the
-# class is only the nearest match. Images whose file names contradict their
-# folder are listed, with reasons, in data/plantdoc_excluded.csv.
+# (plantdoc folder, plantvillage folder, confidence, notes). "approximate"
+# means the PlantDoc folder is broader than the PlantVillage class.
 PLANTDOC_TO_PLANTVILLAGE: tuple[tuple[str, str, str, str], ...] = (
     (
         "Apple Scab Leaf",
@@ -263,14 +260,12 @@ PLANTDOC_TO_PLANTVILLAGE: tuple[tuple[str, str, str, str], ...] = (
     ),
 )
 
-# PlantDoc folders whose every image is in data/plantdoc_excluded.csv. The
-# mapping is right, but the class has no field-test images.
+# PlantDoc folders whose images were all excluded.
 PLANTDOC_WITHOUT_USABLE_IMAGES: tuple[str, ...] = (
     "Tomato two spotted spider mites leaf",
 )
 
-# PlantVillage classes with no honest PlantDoc counterpart. Left out of the
-# field-photo test CSV rather than forced onto a nearby disease.
+# PlantVillage classes with no PlantDoc counterpart.
 UNMAPPED_PLANTVILLAGE: tuple[tuple[str, str], ...] = (
     (
         "Apple___Black_rot",

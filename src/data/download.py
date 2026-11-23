@@ -1,19 +1,9 @@
-"""Download PlantVillage (Kaggle, color subset) and PlantDoc (GitHub).
+"""Download PlantVillage (Kaggle, color subset), its leaf map, and PlantDoc.
 
-Credentials are read from the environment (``KAGGLE_USERNAME`` and
-``KAGGLE_KEY``) or from ``~/.kaggle/kaggle.json``. This module never writes
-credentials and nothing under ``data/raw/`` is committed.
-
-The PlantVillage step also fetches ``leaf-map.json`` from the original
-PlantVillage repository (no Kaggle key needed). ``src.data.splits`` uses it
-to keep every photo of one leaf in the same split.
-
-PlantDoc is pinned to one upstream commit. Six of its file pairs differ only
-by letter case (``CAR1.jpg`` and ``car1.jpg``), which macOS and Windows
-cannot store side by side. On every OS the second file of each pair is
-written as ``<name>__case2<ext>``, so all 2,578 images are kept and every
-machine gets the same paths. A copy downloaded before this rule is repaired
-in place from a file-list-only clone (about 1 MB).
+Kaggle credentials are read from KAGGLE_USERNAME/KAGGLE_KEY or
+~/.kaggle/kaggle.json and are never written anywhere. PlantDoc is pinned
+to one commit. A few of its files differ only by letter case, so the second
+file of each pair is saved as <name>__case2 to keep it on macOS/Windows.
 
 Usage (from the repository root)::
 
@@ -52,15 +42,13 @@ from src.data.paths import (
 
 KAGGLE_DATASET = "abdallahalidev/plantvillage-dataset"
 PLANTDOC_REPO = "https://github.com/pratikkayal/PlantDoc-Dataset.git"
-# The PlantDoc commit the committed CSVs were built from (2 May 2021).
+# PlantDoc commit the CSVs were built from (2 May 2021).
 PLANTDOC_COMMIT = "5467f6012d78d1c446145d5f582da6096f852ae8"
-# Written next to the images after a successful download or repair.
 PLANTDOC_SOURCE_FILE = "SOURCE.json"
 CASE_TWIN_MARK = "__case"
 
-# Leaf IDs published with PlantVillage (Mohanty et al. 2016): file name ->
-# "Class:::leaf number". Pinned to one commit and checked by SHA-256 so the
-# grouped split cannot change underneath the committed CSVs.
+# Leaf ids from the original PlantVillage repo (Mohanty et al. 2016),
+# pinned and checksummed so the grouped split can't change.
 LEAF_MAP_COMMIT = "7f7ecc7e1eaca78107e3affe7cb5abd9427e139a"
 LEAF_MAP_URL = (
     "https://raw.githubusercontent.com/spMohanty/PlantVillage-Dataset/"
@@ -83,12 +71,7 @@ def _lock_down(path: Path) -> None:
 
 
 def kaggle_credentials() -> str | None:
-    """Return where credentials were found, or None.
-
-    The classic username/key pair is what this project documents. Current
-    Kaggle clients also accept a single API token. The returned string is a
-    location, never the secret.
-    """
+    """Return where the credentials were found (not the secret), or None."""
     username = os.environ.get("KAGGLE_USERNAME", "").strip()
     key = os.environ.get("KAGGLE_KEY", "").strip()
     if username and key:
@@ -129,12 +112,11 @@ def _is_image_name(name: str) -> bool:
 
 
 def select_color_members(names: list[str]) -> tuple[str, list[str]]:
-    """Pick the color-subset members inside a Kaggle zip.
+    """Pick the color-subset members of the Kaggle zip.
 
-    The archive also contains grayscale and segmented copies, and sometimes a
-    second nested ``color`` tree. Prefer the color directory that holds the
-    most class images, breaking ties toward the shallower path so the
-    top-level ``color/`` folder wins over a duplicate.
+    The zip also has grayscale and segmented copies, and sometimes a second
+    nested color folder; use the one with the most images, preferring the
+    shallower path.
     """
     grouped: dict[str, list[str]] = {}
     for name in names:
@@ -366,13 +348,10 @@ def case_fold_key(path: str) -> str:
 
 
 def case_twin_renames(paths: Iterable[str]) -> dict[str, str]:
-    """New names for files whose paths differ only by letter case.
+    """Rename files whose paths differ only by letter case.
 
-    Each group is sorted by code point, so ``CAR1.jpg`` comes before
-    ``car1.jpg``. The first path keeps its name; the n-th becomes
-    ``<stem>__case<n><suffix>`` (``car1.jpg`` -> ``car1__case2.jpg``).
-    The rule does not depend on the OS, so every machine gets the same
-    paths.
+    In each group (sorted, so CAR1.jpg comes first) the first file keeps its
+    name and the others become ``<stem>__case<n><suffix>``.
     """
     paths = list(paths)
     groups: dict[str, list[str]] = {}
@@ -434,11 +413,10 @@ def _git_blob_id(path: Path) -> str:
 def _write_case_twins(
     dest: Path, repo: Path, entries: dict[str, str], renames: dict[str, str]
 ) -> None:
-    """Write every member of a case-collision group from its git blob.
+    """Write each case twin from its git blob under its final name.
 
-    A checkout on a case-insensitive disk leaves one file per group (with
-    either twin's bytes). Every member name is removed first, then each
-    blob is written under its final name.
+    A case-insensitive checkout leaves only one file per group, so all member
+    names are removed first.
     """
     renamed_folds = {case_fold_key(path) for path in renames}
     members = sorted(p for p in entries if case_fold_key(p) in renamed_folds)
@@ -517,7 +495,7 @@ def _finish_plantdoc(dest: Path, repo: Path) -> None:
 
 
 def _repair_plantdoc(dest: Path) -> None:
-    """Bring a copy from before the case-twin rule up to date in place."""
+    """Fix an older PlantDoc copy in place."""
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=DOWNLOAD_DIR) as scratch:
         repo = Path(scratch) / "plantdoc-tree"

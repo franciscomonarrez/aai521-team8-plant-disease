@@ -1,15 +1,8 @@
-"""Exact and near-duplicate checks for image files.
+"""MD5 and perceptual-hash (pHash) helpers for finding duplicate images.
 
-``md5_file`` finds byte-identical files. ``phash`` is the 64-bit DCT
-perceptual hash computed the same way as ``imagehash.phash`` (32x32
-grayscale with LANCZOS, 2-D DCT-II, top-left 8x8 block, bits above the
-median), so resized or re-encoded copies of one photo end up a few bits
-apart. ``src.data.splits`` uses the MD5 check to keep byte-identical copies
-out of the PlantDoc test set; the EDA notebook uses both.
-
-A small pHash distance is a hint, not proof: two different stock photos on
-a white background can also be close. Pairs were checked by eye before any
-PlantDoc image was excluded (see ``data/plantdoc_excluded.csv``).
+``phash`` gives the same value as ``imagehash.phash``. A small pHash
+distance only suggests two files are the same photo, so PlantDoc pairs were
+also checked by eye before anything was excluded.
 """
 
 from __future__ import annotations
@@ -60,10 +53,9 @@ def hash_images(
     root: str | Path,
     workers: int | None = None,
 ) -> pd.DataFrame:
-    """Hash every ``root / path``; one row per path, in the given order.
+    """MD5, pHash, size and EXIF orientation for each ``root / path``.
 
-    Width and height are the stored pixel size, before any EXIF rotation.
-    ``workers=0`` hashes in this process; otherwise a process pool is used.
+    ``workers=0`` runs in this process; otherwise a process pool is used.
     """
     root = Path(root)
     files = [str(root / path) for path in paths]
@@ -78,7 +70,7 @@ def hash_images(
     return frame
 
 
-# Set bits in each byte value; summing 8 lookups counts a 64-bit hash.
+# Number of set bits for each byte value.
 _BYTE_BITS = np.array([bin(value).count("1") for value in range(256)])
 
 

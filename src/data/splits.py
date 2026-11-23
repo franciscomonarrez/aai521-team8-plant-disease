@@ -1,35 +1,21 @@
-"""Reproducible PlantVillage splits and the PlantDoc field-test table.
+"""Build the PlantVillage splits and the PlantDoc test CSV.
 
-PlantVillage color images are split about 70/15/15 by leaf, not by image.
-PlantVillage photographed most leaves several times, so an image-level split
-puts the same leaf in train and in test. Each image gets a ``group``: the
-leaf it shows when the original release's ``leaf-map.json`` knows it,
-otherwise its own file name (so byte-identical copies under different Kaggle
-prefixes still stay together). ``StratifiedGroupKFold`` with
-``random_state=42`` deals the groups into 20 folds of similar class balance;
-folds 0-2 are test, 3-5 are val, and 6-19 are train. The ``fold`` column is
-written too, so train can be reused for grouped cross-validation.
+PlantVillage is split about 70/15/15 by leaf instead of by image, because
+most leaves were photographed several times. Each image gets a group (its
+leaf id from leaf-map.json, or its file name if the leaf is unknown) and
+StratifiedGroupKFold with 20 folds and seed 42 assigns the groups to folds:
+0-2 are test, 3-5 val and 6-19 train.
 
-Rows are sorted by path before the split so the result does not depend on
-directory order, and the written CSVs are sorted the same way. Training code
-should shuffle in the DataLoader.
-
-PlantDoc is not mixed into train or val. Every mapped PlantDoc image is a
-field-photo test row whose ``label`` is the matching PlantVillage class and
-whose ``source_split`` is PlantDoc's own train/ or test/ folder. Classes that
-do not match are listed in ``data/plantdoc_label_map.csv`` and are left out.
-Images listed in ``data/plantdoc_excluded.csv`` (hand-reviewed: duplicate
-photos, the same photo filed under two labels, and file names that name a
-different disease) are left out too. The build fails if that list does not
-match the PlantDoc copy on disk, if two paths differ only by letter case, or
-if two kept images are byte-identical.
+PlantDoc is only used as a test set. Images listed in
+data/plantdoc_excluded.csv (duplicates, conflicting labels, and file names
+that point to another disease) are left out.
 
 Usage (from the repository root)::
 
     python -m src.data.splits
     python -m src.data.splits --plantdoc-only  # no PlantVillage needed
     python -m src.data.splits --map-only
-    python -m src.data.splits --image-level   # old leaky split, for comparison
+    python -m src.data.splits --image-level    # old image-level split
 """
 
 from __future__ import annotations
@@ -82,16 +68,13 @@ MAP_COLUMNS = [
 EXCLUDED_COLUMNS = [
     "path", "source_split", "label", "reason", "kept_path", "detail",
 ]
-# file_name: the name says another disease, crop or a symptom in a healthy
-# folder. duplicate: another copy of the same photo (same label) is kept.
-# conflicting_duplicate: the same photo is filed under another label; at
-# most one copy is kept, and only when a file name settles the label.
+# file_name: the name points to another disease, crop or plant.
+# duplicate: same photo and label kept elsewhere.
+# conflicting_duplicate: same photo filed under two labels.
 EXCLUSION_REASONS = ("file_name", "duplicate", "conflicting_duplicate")
 
-# leaf-map.json calls Apple black rot "Apple_Frogeye Spot".
+# leaf-map.json names that differ from the Kaggle folders and files.
 LEAF_MAP_CLASS_ALIASES = {"Apple___Black_rot": "Apple_Frogeye Spot"}
-# Released Target Spot files are named "Com.G_TgS_FL 1234"; leaf-map.json
-# lists the same frames as "Com.G_FL 1234". All 1,404 match after this.
 LEAF_MAP_STEM_PREFIXES = {
     "Tomato___Target_Spot": ("com.g_tgs_fl ", "com.g_fl "),
 }
@@ -145,11 +128,7 @@ def check_plantvillage_classes(frame: pd.DataFrame) -> None:
 
 
 def original_stem(path: str) -> str:
-    """Lower-cased file stem without the Kaggle ``<uuid>___`` prefix.
-
-    This is the key ``leaf-map.json`` uses, e.g.
-    ``.../0a1b___RS_HL 6268.JPG`` -> ``rs_hl 6268``.
-    """
+    """Lower-cased file stem without the Kaggle ``<uuid>___`` prefix."""
     stem = PurePosixPath(path).stem
     if "___" in stem:
         stem = stem.split("___", 1)[1]
@@ -157,13 +136,10 @@ def original_stem(path: str) -> str:
 
 
 def load_leaf_map(path: Path = LEAF_MAP_PATH) -> dict[str, dict[str, str]]:
-    """Read ``leaf-map.json`` as ``{map_class: {file_stem: leaf_id}}``.
+    """Read leaf-map.json as ``{map_class: {file_stem: leaf_id}}``.
 
-    Leaf ids are kept as written minus a trailing ``.0``, so batch prefixes
-    such as ``OCT_769`` (citrus) and ``JR_12`` (pepper) stay distinct from
-    leaf 769 or 12 of another batch. Entries with no leaf (four Cherry rows
-    say ``n/a``) are dropped; those images fall back to a per-file group
-    instead of being merged into one fake leaf.
+    Batch prefixes such as OCT_769 stay part of the id. Entries without a
+    leaf (four Cherry rows say n/a) are skipped.
     """
     if not path.is_file():
         raise FileNotFoundError(
@@ -191,12 +167,7 @@ def load_leaf_map(path: Path = LEAF_MAP_PATH) -> dict[str, dict[str, str]]:
 def leaf_groups(
     frame: pd.DataFrame, leaf_map: dict[str, dict[str, str]]
 ) -> pd.Series:
-    """One group id per row: the photographed leaf when known.
-
-    Rows found in the leaf map get ``leaf:<label>:<number>``. The rest get
-    ``file:<label>:<stem>``; that still keeps copies of one original file
-    (same name under a different Kaggle prefix) in the same group.
-    """
+    """``leaf:<label>:<id>`` when the leaf is known, else ``file:<label>:<stem>``."""
     groups: list[str] = []
     for path, label in zip(frame["path"], frame["label"], strict=True):
         stem = original_stem(path)
@@ -232,14 +203,10 @@ def grouped_splits(
     test_ratio: float = TEST_RATIO,
     n_folds: int = N_FOLDS,
 ) -> dict[str, pd.DataFrame]:
-    """Leaf-grouped train/val/test split; no group is in two splits.
+    """Leaf-grouped train/val/test split with StratifiedGroupKFold.
 
-    ``frame`` needs ``path``, ``label`` and ``group``. It is sorted by path,
-    then ``StratifiedGroupKFold(n_folds, shuffle=True, random_state=seed)``
-    assigns every group to one fold. The first ``test_ratio * n_folds``
-    folds are test, the next ``val_ratio * n_folds`` are val, the rest are
-    train. Split sizes are close to the ratios but not exact, because whole
-    groups move together.
+    The first ``test_ratio * n_folds`` folds are test, the next
+    ``val_ratio * n_folds`` are val, and the rest are train.
     """
     _check_ratios(train_ratio, val_ratio, test_ratio)
     test_folds = round(test_ratio * n_folds)
@@ -287,18 +254,12 @@ def stratified_splits(
     val_ratio: float = VAL_RATIO,
     test_ratio: float = TEST_RATIO,
 ) -> dict[str, pd.DataFrame]:
-    """Image-level stratified split (the original one; it leaks leaves).
-
-    Kept only to rebuild ``*_imagelevel.csv`` for comparison. The frame is
-    sorted first. Both ``train_test_split`` calls use ``seed``.
-    """
+    """Old image-level split, only used to rebuild ``*_imagelevel.csv``."""
     _check_ratios(train_ratio, val_ratio, test_ratio)
 
     ordered = frame.sort_values(SPLIT_COLUMNS).reset_index(drop=True)
     counts = ordered["label"].value_counts()
-    # The second stratified cut needs at least two rows per class in the
-    # 30% holdout, which is safe for this dataset (smallest class is >100)
-    # and fails loudly on a toy folder a teammate pointed at by mistake.
+    # The second cut needs a few rows per class in the holdout.
     rare = counts[counts < 10]
     if not rare.empty:
         detail = ", ".join(f"{label} ({count})" for label, count in rare.items())
@@ -366,10 +327,9 @@ def iter_plantdoc_class_dirs(plantdoc_root: Path) -> list[tuple[str, Path]]:
 def scan_plantdoc(
     plantdoc_root: Path, project_root: Path = PROJECT_ROOT
 ) -> tuple[pd.DataFrame, list[str], int]:
-    """Every PlantDoc image in a mapped folder, before any exclusion.
+    """All images in mapped PlantDoc folders, before exclusions.
 
-    Returns ``path,label,source_split`` rows, the PlantDoc folders with no
-    crosswalk entry, and the number of images seen in all folders.
+    Also returns the unmapped folder names and the total image count.
     """
     class_dirs = iter_plantdoc_class_dirs(plantdoc_root)
     if not class_dirs:
@@ -403,11 +363,7 @@ def scan_plantdoc(
 def check_plantdoc_copy(
     plantdoc_root: Path, frame: pd.DataFrame, seen: int
 ) -> None:
-    """Fail unless this is the pinned PlantDoc copy with both case twins.
-
-    A copy cloned on macOS or Windows before the case-twin fix is missing
-    six images, and a Linux copy has twins that the committed CSV renamed.
-    """
+    """Fail unless this is the pinned PlantDoc copy with both case twins."""
     repair = (
         "Run python -m src.data.download --plantdoc-only to repair it "
         "(downloads about 1 MB)."
@@ -436,7 +392,7 @@ def check_plantdoc_copy(
 def load_plantdoc_exclusions(
     path: Path = PLANTDOC_EXCLUDED_PATH,
 ) -> pd.DataFrame:
-    """Read the reviewed PlantDoc exclusion list."""
+    """Read data/plantdoc_excluded.csv."""
     if not path.is_file():
         raise FileNotFoundError(f"PlantDoc exclusion list not found: {path}")
     frame = pd.read_csv(path, dtype=str, keep_default_na=False)
@@ -454,7 +410,7 @@ def load_plantdoc_exclusions(
 def apply_plantdoc_exclusions(
     frame: pd.DataFrame, exclusions: pd.DataFrame
 ) -> pd.DataFrame:
-    """Drop the listed rows after checking the list matches ``frame``."""
+    """Drop the excluded rows, after checking the list matches ``frame``."""
     labels = dict(zip(frame["path"], frame["label"], strict=True))
     absent = sorted(set(exclusions["path"]) - set(labels))
     if absent:
@@ -501,12 +457,9 @@ def collect_plantdoc_test(
     project_root: Path = PROJECT_ROOT,
     excluded_path: Path = PLANTDOC_EXCLUDED_PATH,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    """Map PlantDoc images onto PlantVillage labels, minus the exclusions.
+    """PlantDoc test rows (both upstream folders) minus the exclusions.
 
-    Both upstream train and test folders are included. PlantDoc is a field
-    test set for models trained on PlantVillage, so its own train folder is
-    not used for training. Returns the kept rows, the exclusion list, and
-    PlantDoc class names that had no crosswalk entry.
+    Returns the kept rows, the exclusion list, and unmapped folder names.
     """
     frame, unknown, seen = scan_plantdoc(plantdoc_root, project_root)
     check_plantdoc_copy(plantdoc_root, frame, seen)
@@ -528,11 +481,10 @@ def collect_plantdoc_test(
 
 
 def label_map_frame(extra_unmapped_plantdoc: list[str] | None = None) -> pd.DataFrame:
-    """Documented crosswalk, including PlantVillage classes with no field photos.
+    """PlantDoc to PlantVillage mapping, including classes with no photos.
 
-    ``status`` is ``mapped`` (field photos in plantdoc_test.csv),
-    ``no_usable_images`` (the folder maps here but every image was
-    excluded) or ``unmapped`` (no PlantDoc folder).
+    ``status`` is mapped, no_usable_images (every image excluded) or
+    unmapped.
     """
     rows: list[dict[str, str]] = []
     known = set(PLANTDOC_TO_PLANTVILLAGE_LABEL)
@@ -696,12 +648,10 @@ def build_splits(
     plantdoc_only: bool = False,
     plantdoc_excluded_path: Path = PLANTDOC_EXCLUDED_PATH,
 ) -> None:
-    """Write the split CSVs, the PlantDoc test CSV, and the label map.
+    """Write the split CSVs, the PlantDoc test CSV and the label map.
 
-    With ``image_level=True`` only ``{train,val,test}_imagelevel.csv`` are
-    written, using the original image-level split (for comparison). With
-    ``plantdoc_only=True`` only ``plantdoc_test.csv`` and the label map are
-    written, so PlantVillage is not needed.
+    ``image_level`` writes only the old ``*_imagelevel.csv`` files;
+    ``plantdoc_only`` skips PlantVillage.
     """
     if map_only:
         write_frame(label_map_frame(), label_map_path, MAP_COLUMNS)
